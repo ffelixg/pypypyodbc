@@ -5,7 +5,6 @@ import warnings
 import functools
 import itertools
 import numpy as np
-# import const
 import sqlheaders as headers
 
 from importlib import reload
@@ -30,7 +29,7 @@ for dt in [
 sql_c_to_numpy_dtypes.update({
     ("numeric", "SQL_C_CHAR"): (numeric_char := lambda sql_size: f"S{2 + int(np.ceil(sql_size * np.emath.logn(8, 10)))}"),
     ("decimal", "SQL_C_CHAR"): numeric_char,
-    ("nchar", "SQL_C_WCHAR"): (nchar := lambda sql_size: f"V{2*(sql_size + 1)}"), # null terminated
+    ("nchar", "SQL_C_WCHAR"): (nchar := lambda sql_size: f"V{2*sql_size + 2}"), # null terminated
     ("nvarchar", "SQL_C_WCHAR"): nchar,
     ("char", "SQL_C_CHAR"): (char := lambda sql_size: f"S{sql_size + 1}"),
     ("varchar", "SQL_C_CHAR"): char,
@@ -48,7 +47,7 @@ sql_c_to_numpy_dtypes.update({
     
     ("char", "SQL_C_WCHAR"): nchar,
     ("varchar", "SQL_C_WCHAR"): nchar,
-    ("binary", "SQL_C_WCHAR"): (binary := lambda sql_size: f"V{4*sql_size}"),
+    ("binary", "SQL_C_WCHAR"): (binary := lambda sql_size: f"V{4*sql_size+2}"),
     ("varbinary", "SQL_C_WCHAR"): binary,
 })
 
@@ -384,10 +383,17 @@ class stmt(_base):
         ))
 
     def SQLGetData(self, index, c_type, buffer_ref, buffer_width, StrLen_or_IndPtr):
-        "https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetdata-function"
-        self.check_error(odbc.SQLGetData(  
+        """
+        https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlgetdata-function
+        Return a boolean indicating if there is more data"""
+        ret = odbc.SQLGetData(  
             self.handle, index, c_type, buffer_ref, buffer_width, StrLen_or_IndPtr
-        ))
+        )
+        if ret == headers.SQL_SUCCESS_WITH_INFO:
+            return True
+        else:
+            self.check_error(ret)
+            return False
 
     def SQLPutData(self, buffer_ref, StrLen_or_IndPtr):
         "https://learn.microsoft.com/en-us/sql/odbc/reference/syntax/sqlputdata-function"
@@ -472,54 +478,58 @@ class stmt(_base):
                 npref(buffer), buffer.itemsize, npref(actual_width)
             )
 
-    def bind_columns_late(self, metadata, buffers, rowcount):
-        "Use SQLGetData for unbound columns after fetching"
-        extra_data = {}
+    def bind_columns_late(self, metadata, buffers, padding_length, offset=0):
+        """
+        Use SQLGetData for unbound columns after fetching.
+        Can only be used with fetch_array_length = 1
+        If Data does not fit into the buffer cell, it will be assembled into an
+        array of length 1 and returned.
+        """
+        assert self.fetch_array_length == 1
+        extra_data = []
         for col, (meta_col, (buffer, actual_width)) in enumerate(zip(metadata, buffers, strict=True), 1):
             if meta_col["bindable"]:
                 continue
-            extra_buffer = np.zeros(1, dtype=buffer.dtype)
-            extra_width = np.zeros(1, dtype=actual_width.dtype)
-            assert rowcount <= len(actual_width)
-            for pos in range(rowcount):
-                if len(actual_width) > 1:
-                    self.SQLSetPos(
-                        pos+1,
-                        headers.SQL_POS_POSITION,
-                        headers.SQL_LOCK_NO_CHANGE
-                    )
-                print(col, pos)
-                self.SQLGetData(
+            
+            current_buffer = buffer
+            current_width = actual_width
+            current_offset = offset
+            
+            size_buf = buffer.itemsize
+            size_width = actual_width.itemsize
+            
+            data_list = []
+            more_data = True
+            while more_data:
+                more_data = self.SQLGetData(
                     col,
                     meta_col["c_type"],
-                    npref(buffer, offset=pos*buffer.itemsize),
+                    npref(current_buffer, offset=current_offset*size_buf),
                     buffer.itemsize,
-                    npref(actual_width, offset=pos*actual_width.itemsize)
+                    npref(current_width, offset=current_offset*size_width)
                 )
-                if actual_width[pos] == headers.SQL_NULL_DATA:
-                    continue # GetData never raises NoData -> loop
-                while True:
-                    try:
-                        self.SQLGetData(
-                            col,
-                            meta_col["c_type"],
-                            npref(extra_buffer),
-                            extra_buffer.itemsize,
-                            npref(extra_width)
-                        )
-                    except NoData:
-                        break
-                    else:
-                        # cp = extra_buffer[0], extra_width[0] # this copies
-                        # cp = extra_buffer.copy(), extra_width.copy()
-                        cp = extra_buffer.copy(), extra_width[0]
-                        if col in extra_data:
-                            if pos in extra_data[col]:
-                                extra_data[col][pos].append(cp)
-                            else:
-                                extra_data[col][pos] = [cp]
-                        else:
-                            extra_data[col] = {pos: [cp]}
+                w = current_width[current_offset]
+                # col must not be bindable
+                more_data = (
+                    meta_col["partial_fetch"] and
+                    (w == headers.SQL_NO_TOTAL or w > size_buf - padding_length)
+                )
+                if more_data:
+                    # assert w == headers.SQL_NO_TOTAL, w
+                    data_list.append(current_buffer[[current_offset]].view("|V1")[:size_buf-padding_length])
+                    current_buffer = np.zeros(1, dtype=buffer.dtype)
+                    current_width = np.zeros(1, dtype=actual_width.dtype)
+                    current_offset = 0
+                elif w == headers.SQL_NULL_DATA:
+                    assert not data_list
+                else:
+                    assert w >= 0, w
+                    if data_list:
+                        data_list.append(current_buffer[[current_offset]].view("|V1")[:w])
+            extra_data.append(
+                (x := np.concatenate(data_list)).view(f"|V{len(x)}")
+                if data_list else None
+            )
         return extra_data
 
     def bind_columns_row(self, metadata, buffer):
@@ -869,24 +879,25 @@ def select_into(
         
 
 def select_into_csv(
-    con, select, file_target,
-    buffer_length=10000,
-    sep=b'A\x94\xf1\x950\xfa',
-    end=b"_\x00",
+    sql, con, file_target,
+    buffer_length=1000,
+    sep=",".encode("utf-16-le"),
+    end="\n".encode("utf-16-le"),
     byte_order_mark=False
 ):
     with (
         con.stmt() as stmt
     ):
-        if buffer_length > 1:
-            stmt.cursor_type = headers.SQL_CURSOR_DYNAMIC
-        row_status = stmt.create_row_status(buffer_length)
-        stmt.SQLExecDirect(select)
-        
-        rowcount = stmt.SQLRowCount()
-        print(rowcount)
+        stmt.SQLExecDirect(sql)
         metadata = stmt.sql_metadata("result")
         c_metadata_from_sql(metadata, sql_c_type_map=sql_c_type_map_wchar)
+        
+        nonbindables = [col for col, m in enumerate(metadata) if not m["bindable"]]
+        if nonbindables:
+            buffer_length = 1
+        
+        row_status = stmt.create_row_status(buffer_length)
+        
         buffers = create_buffers(metadata, buffer_length)
 
         stmt.bind_columns(metadata, buffers)
@@ -894,6 +905,27 @@ def select_into_csv(
         
         if byte_order_mark: # assumes utf-16-le, bcp does this
             file_target.write(b'\xff\xfe')
+        
+        def column_generator(col, current_length, extra_data):
+            try:
+                extra_idx = nonbindables.index(col)
+            except ValueError:
+                pass
+            else:
+                if (v := extra_data[extra_idx]) is not None:
+                    yield v[0].tobytes()
+                    return
+            buf, act = buffers[col]
+            for idx in range(current_length):
+                w = act[idx]
+                if w == headers.SQL_NULL_DATA:
+                    yield b""
+                    continue
+                assert w >= 0
+                # TODO make sure this doesn't get called with something other
+                # than |Vx dtype, otherwise .tobytes() will fail
+                # maybe even [:w] due to implicit truncation
+                yield buf[idx].tobytes()[:w]
         
         while True:
             try:
@@ -905,46 +937,12 @@ def select_into_csv(
             current_length = int(
                 not (ind := (row_status == headers.SQL_ROW_NOROW)).any() and buffer_length or ind.argmax()
             )
-            extra_data = stmt.bind_columns_late(metadata, buffers, current_length)
-            def cut(buf, width):
-                match width:
-                    case headers.SQL_NULL_DATA:
-                        w = 0
-                    case headers.SQL_NO_TOTAL:
-                        w = -2 # remove null terminator, different if not 16bit
-                    case _ if width >= 0:
-                        w = width
-                        if w == 0: print(buf[:5])
-                    case _:
-                        raise Exception()
-                return buf.view("|V1")[:w]
-            def reformat(buf):
-                if (l := len(buf)) == 0:
-                    return b""
-                else:
-                    return buf.view(f"|V{l}")[0].tobytes()
-            def cut_and_combined(col):
-                buffer, actual_width = buffers[col]
-                # -2 may be different for char/binary
-                try:
-                    extra = extra_data[col]
-                except KeyError:
-                    for pos in range(current_length):
-                        yield reformat(cut(buffer[[pos]], actual_width[pos]))
-                else:
-                    for pos in range(current_length):
-                        yield reformat(np.concatenate([
-                            cut(b, w)
-                            for b, w in itertools.chain(
-                                ((buffer[[pos]], actual_width[pos]),),
-                                extra.get(pos, ())
-                            )
-                        ]))
-            column_generators = []
-            for data in zip(
-                *(cut_and_combined(col) for col in range(len(metadata))),
-                itertools.cycle((end,))
-            ):
-                file_target.write(sep.join(data))
-        
-        
+            extra_data = stmt.bind_columns_late(metadata, buffers, 2, offset=0)
+            
+            for data in zip(*(
+                column_generator(col, current_length, extra_data)
+                for col in range(len(metadata))
+            )):
+                for i, d in enumerate(data):
+                    file_target.write(d)
+                    file_target.write(end if i == len(metadata) - 1 else sep)
