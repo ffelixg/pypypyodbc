@@ -485,7 +485,7 @@ class stmt(_base):
         If Data does not fit into the buffer cell, it will be assembled into an
         array of length 1 and returned.
         """
-        assert self.fetch_array_length == 1
+        # assert self.fetch_array_length == 1
         extra_data = []
         for col, (meta_col, (buffer, actual_width)) in enumerate(zip(metadata, buffers, strict=True), 1):
             if meta_col["bindable"]:
@@ -946,3 +946,67 @@ def select_into_csv(
                 for i, d in enumerate(data):
                     file_target.write(d)
                     file_target.write(end if i == len(metadata) - 1 else sep)
+
+
+def select_into_csv_nobind(
+    sql, con, file_target,
+    sep=",".encode("utf-16-le"),
+    end="\n".encode("utf-16-le"),
+    byte_order_mark=False
+):
+    padding_length = 2
+    empty_string_replacement = "\x00\x00"
+
+    buffer_size = 1024
+    buffer_size_ctype = headers.SQLLEN(buffer_size)
+    buffer_size_nopad = buffer_size - padding_length
+    buffer = np.zeros(buffer_size, dtype="V1")
+    buffer_addr = npref(buffer)
+    width = np.zeros(1, dtype=np.int64)
+    width_addr = npref(width)
+
+    with con.stmt() as stmt:
+        stmt.SQLExecDirect(sql)
+        metadata = stmt.sql_metadata("result")
+        c_metadata_from_sql(metadata, sql_c_type_map=sql_c_type_map_wchar)
+        
+        iterator = tuple(
+            (headers.SQLUSMALLINT(col), headers.SQLSMALLINT(meta_col["c_type"]))
+            for col, meta_col in enumerate(metadata, 1)
+        )
+        
+        if byte_order_mark: # assumes utf-16-le, bcp does this
+            file_target.write(b'\xff\xfe')
+        while True:
+            try:
+                stmt.SQLFetch()
+            except NoData:
+                break
+            for col, c_type in iterator:
+                while True:
+                    stmt.SQLGetData(
+                        col,
+                        c_type,
+                        buffer_addr,
+                        buffer_size_ctype,
+                        width_addr,
+                    )
+                    w = width[0]
+                    match w:
+                        case headers.SQL_NO_TOTAL:
+                            file_target.write(buffer[:buffer_size_nopad].tobytes())
+                        case headers.SQL_NULL_DATA:
+                            # file_target.write(null_replacement_value)
+                            break
+                        case _ if w < 0:
+                            raise Exception(w)
+                        case _ if w == 0:
+                            file_target.write(empty_string_replacement)
+                            break
+                        case _ if w <= buffer_size_nopad:
+                            file_target.write(buffer[:w].tobytes())
+                            break
+                        case _:
+                            file_target.write(buffer[:buffer_size_nopad].tobytes())
+                file_target.write(sep)
+            file_target.write(end)
